@@ -1849,7 +1849,7 @@ impl AppState {
         };
         let Some(bytes) = rt.encode_mouse_wheel(mouse.kind, position, mouse.modifiers) else {
             warn!(pane = info.id.raw(), kind = ?mouse.kind, "failed to encode mouse wheel event");
-            return true;
+            return false;
         };
         if let Err(err) = rt.try_send_bytes(Bytes::from(bytes)) {
             warn!(pane = info.id.raw(), err = %err, "failed to forward mouse wheel event");
@@ -2474,6 +2474,43 @@ mod tests {
             .and_then(crate::terminal::TerminalRuntime::scroll_metrics)
             .expect("scroll metrics after wheel");
         assert_eq!(metrics.offset_from_bottom, 7);
+    }
+
+    #[tokio::test]
+    async fn terminal_wheel_falls_back_to_scrollback_when_mouse_report_encoding_fails() {
+        let mut app = app_for_mouse_test();
+        let mut ws = Workspace::test_new("test");
+        let pane_id = ws.tabs[0].root_pane;
+        let pane_infos = ws.tabs[0].layout.panes(Rect::new(0, 0, 300, 18));
+        let info = pane_infos[0].clone();
+        ws.tabs[0].runtimes.insert(
+            pane_id,
+            crate::terminal::TerminalRuntime::test_with_scrollback_bytes(
+                info.inner_rect.width,
+                info.inner_rect.height,
+                16 * 1024,
+                &[numbered_lines_bytes(64).as_slice(), b"\x1b[?1000h"].concat(),
+            ),
+        );
+
+        app.state.workspaces = vec![ws];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        app.state.view.pane_infos = pane_infos;
+
+        app.handle_mouse(mouse(
+            MouseEventKind::ScrollUp,
+            info.inner_rect.x + 250,
+            info.inner_rect.y + 1,
+        ));
+
+        let metrics = app
+            .state
+            .runtime_for_pane_in_workspace(&app.terminal_runtimes, 0, pane_id)
+            .and_then(crate::terminal::TerminalRuntime::scroll_metrics)
+            .expect("scroll metrics after failed mouse report encoding");
+        assert_eq!(metrics.offset_from_bottom, 3);
     }
 
     #[tokio::test]
