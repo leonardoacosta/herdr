@@ -1,5 +1,6 @@
 use crate::api::schema::{
-    EmptyParams, LayoutSetSplitRatioParams, Method, PaneFocusDirectionParams, PaneRenameParams,
+    EmptyParams, LayoutSetSplitDirectionParams, LayoutSetSplitRatioParams, Method,
+    PaneFocusDirectionParams, PaneInputSetParams, PaneMoveParams, PaneRenameParams,
     PaneResizeParams, PaneSplitParams, PaneSwapParams, PaneTarget, PaneZoomParams, TabCreateParams,
     TabMoveParams, TabRenameParams, TabTarget, WorkspaceCreateParams, WorkspaceMoveBlockParams,
     WorkspaceMoveParams, WorkspaceRenameParams, WorkspaceTarget, WorktreeCreateParams,
@@ -117,6 +118,14 @@ impl App {
         self.dispatch_runtime_mutation(id, Method::PaneRename(params))
     }
 
+    pub(crate) fn runtime_pane_input_set(
+        &mut self,
+        id: &'static str,
+        params: PaneInputSetParams,
+    ) -> String {
+        self.dispatch_runtime_mutation(id, Method::PaneInputSet(params))
+    }
+
     pub(crate) fn runtime_pane_focus_direction(
         &mut self,
         id: &'static str,
@@ -137,6 +146,10 @@ impl App {
         self.dispatch_runtime_mutation(id, Method::PaneSwap(params))
     }
 
+    pub(crate) fn runtime_pane_move(&mut self, id: &'static str, params: PaneMoveParams) -> String {
+        self.dispatch_runtime_mutation(id, Method::PaneMove(params))
+    }
+
     pub(crate) fn runtime_pane_split(
         &mut self,
         id: &'static str,
@@ -155,6 +168,14 @@ impl App {
         params: LayoutSetSplitRatioParams,
     ) -> String {
         self.dispatch_runtime_mutation(id, Method::LayoutSetSplitRatio(params))
+    }
+
+    pub(crate) fn runtime_layout_set_split_direction(
+        &mut self,
+        id: &'static str,
+        params: LayoutSetSplitDirectionParams,
+    ) -> String {
+        self.dispatch_runtime_mutation(id, Method::LayoutSetSplitDirection(params))
     }
 
     pub(crate) fn runtime_worktree_create_deferred(

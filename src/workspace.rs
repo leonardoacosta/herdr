@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use ratatui::layout::Direction;
@@ -12,6 +12,7 @@ use crate::layout::PaneId;
 #[cfg(test)]
 use crate::layout::TileLayout;
 use crate::pane::{PaneLaunchEnv, PaneState};
+use crate::render_signal::RenderSignal;
 use crate::terminal::{TerminalId, TerminalRuntime, TerminalRuntimeRegistry, TerminalState};
 
 mod aggregate;
@@ -82,12 +83,19 @@ impl WorkspaceGitStatusSnapshot {
         status_cache_key: PathBuf,
         demand: GitStatusRefreshDemand,
     ) -> WorkspaceGitStatus {
+        let auto_label = self
+            .space
+            .as_ref()
+            .map(|space| {
+                self::git::automatic_workspace_label(&resolved_identity_cwd, &space.repo_root)
+            })
+            .unwrap_or_else(|| fallback_label_from_cwd(&resolved_identity_cwd));
         WorkspaceGitStatus {
             workspace_id,
             resolved_identity_cwd,
             status_cache_key,
             demand,
-            auto_label: self.auto_label,
+            auto_label,
             branch: self.branch,
             ahead_behind: self.ahead_behind,
             space: self.space,
@@ -234,7 +242,7 @@ impl Workspace {
         moved: MovedPane,
         events: mpsc::Sender<AppEvent>,
         render_notify: Arc<Notify>,
-        render_dirty: Arc<AtomicBool>,
+        render_dirty: Arc<RenderSignal>,
     ) -> Self {
         let id = generate_workspace_id();
         let root_pane = moved.pane_id;
@@ -275,10 +283,11 @@ impl Workspace {
         cols: u16,
         scrollback_limit_bytes: usize,
         host_terminal_theme: crate::terminal_theme::TerminalTheme,
+        host_terminal_appearance: Option<crate::terminal_theme::HostAppearance>,
         shell_config: crate::pane::PaneShellConfig<'_>,
         events: mpsc::Sender<AppEvent>,
         render_notify: Arc<Notify>,
-        render_dirty: Arc<AtomicBool>,
+        render_dirty: Arc<RenderSignal>,
     ) -> std::io::Result<(Self, TerminalState, TerminalRuntime)> {
         Self::new_with_extra_env(
             initial_cwd,
@@ -286,6 +295,7 @@ impl Workspace {
             cols,
             scrollback_limit_bytes,
             host_terminal_theme,
+            host_terminal_appearance,
             shell_config,
             events,
             render_notify,
@@ -301,10 +311,11 @@ impl Workspace {
         cols: u16,
         scrollback_limit_bytes: usize,
         host_terminal_theme: crate::terminal_theme::TerminalTheme,
+        host_terminal_appearance: Option<crate::terminal_theme::HostAppearance>,
         shell_config: crate::pane::PaneShellConfig<'_>,
         events: mpsc::Sender<AppEvent>,
         render_notify: Arc<Notify>,
-        render_dirty: Arc<AtomicBool>,
+        render_dirty: Arc<RenderSignal>,
         extra_env: Vec<(String, String)>,
     ) -> std::io::Result<(Self, TerminalState, TerminalRuntime)> {
         Self::new_with_tab(
@@ -313,6 +324,7 @@ impl Workspace {
             cols,
             scrollback_limit_bytes,
             host_terminal_theme,
+            host_terminal_appearance,
             shell_config,
             events,
             render_notify,
@@ -331,9 +343,10 @@ impl Workspace {
         argv: &[String],
         scrollback_limit_bytes: usize,
         host_terminal_theme: crate::terminal_theme::TerminalTheme,
+        host_terminal_appearance: Option<crate::terminal_theme::HostAppearance>,
         events: mpsc::Sender<AppEvent>,
         render_notify: Arc<Notify>,
-        render_dirty: Arc<AtomicBool>,
+        render_dirty: Arc<RenderSignal>,
     ) -> std::io::Result<(Self, TerminalState, TerminalRuntime)> {
         Self::new_argv_command_with_extra_env(
             initial_cwd,
@@ -342,6 +355,7 @@ impl Workspace {
             argv,
             scrollback_limit_bytes,
             host_terminal_theme,
+            host_terminal_appearance,
             events,
             render_notify,
             render_dirty,
@@ -357,9 +371,10 @@ impl Workspace {
         argv: &[String],
         scrollback_limit_bytes: usize,
         host_terminal_theme: crate::terminal_theme::TerminalTheme,
+        host_terminal_appearance: Option<crate::terminal_theme::HostAppearance>,
         events: mpsc::Sender<AppEvent>,
         render_notify: Arc<Notify>,
-        render_dirty: Arc<AtomicBool>,
+        render_dirty: Arc<RenderSignal>,
         extra_env: Vec<(String, String)>,
     ) -> std::io::Result<(Self, TerminalState, TerminalRuntime)> {
         Self::new_with_tab(
@@ -368,6 +383,7 @@ impl Workspace {
             cols,
             scrollback_limit_bytes,
             host_terminal_theme,
+            host_terminal_appearance,
             crate::pane::PaneShellConfig::new("", crate::config::ShellModeConfig::NonLogin),
             events,
             render_notify,
@@ -384,10 +400,11 @@ impl Workspace {
         cols: u16,
         scrollback_limit_bytes: usize,
         host_terminal_theme: crate::terminal_theme::TerminalTheme,
+        host_terminal_appearance: Option<crate::terminal_theme::HostAppearance>,
         shell_config: crate::pane::PaneShellConfig<'_>,
         events: mpsc::Sender<AppEvent>,
         render_notify: Arc<Notify>,
-        render_dirty: Arc<AtomicBool>,
+        render_dirty: Arc<RenderSignal>,
         argv: Option<&[String]>,
         extra_env: Vec<(String, String)>,
     ) -> std::io::Result<(Self, TerminalState, TerminalRuntime)> {
@@ -406,6 +423,7 @@ impl Workspace {
                 argv,
                 scrollback_limit_bytes,
                 host_terminal_theme,
+                host_terminal_appearance,
                 &launch_env,
                 events,
                 render_notify,
@@ -419,6 +437,7 @@ impl Workspace {
                 cols,
                 scrollback_limit_bytes,
                 host_terminal_theme,
+                host_terminal_appearance,
                 shell_config,
                 &launch_env,
                 events,
@@ -500,6 +519,7 @@ impl Workspace {
         cwd: PathBuf,
         scrollback_limit_bytes: usize,
         host_terminal_theme: crate::terminal_theme::TerminalTheme,
+        host_terminal_appearance: Option<crate::terminal_theme::HostAppearance>,
         shell_config: crate::pane::PaneShellConfig<'_>,
         extra_env: Vec<(String, String)>,
     ) -> std::io::Result<(usize, TerminalState, TerminalRuntime)> {
@@ -509,6 +529,7 @@ impl Workspace {
             cwd,
             scrollback_limit_bytes,
             host_terminal_theme,
+            host_terminal_appearance,
             shell_config,
             None,
             extra_env,
@@ -524,6 +545,7 @@ impl Workspace {
         extra_env: Vec<(String, String)>,
         scrollback_limit_bytes: usize,
         host_terminal_theme: crate::terminal_theme::TerminalTheme,
+        host_terminal_appearance: Option<crate::terminal_theme::HostAppearance>,
     ) -> std::io::Result<(usize, TerminalState, TerminalRuntime)> {
         self.create_tab_with_runtime(
             rows,
@@ -531,6 +553,7 @@ impl Workspace {
             cwd,
             scrollback_limit_bytes,
             host_terminal_theme,
+            host_terminal_appearance,
             crate::pane::PaneShellConfig::new("", crate::config::ShellModeConfig::NonLogin),
             Some(argv),
             extra_env,
@@ -544,6 +567,7 @@ impl Workspace {
         cwd: PathBuf,
         scrollback_limit_bytes: usize,
         host_terminal_theme: crate::terminal_theme::TerminalTheme,
+        host_terminal_appearance: Option<crate::terminal_theme::HostAppearance>,
         shell_config: crate::pane::PaneShellConfig<'_>,
         argv: Option<&[String]>,
         extra_env: Vec<(String, String)>,
@@ -574,6 +598,7 @@ impl Workspace {
                 argv,
                 scrollback_limit_bytes,
                 host_terminal_theme,
+                host_terminal_appearance,
                 &launch_env,
                 events,
                 render_notify,
@@ -587,6 +612,7 @@ impl Workspace {
                 cols,
                 scrollback_limit_bytes,
                 host_terminal_theme,
+                host_terminal_appearance,
                 shell_config,
                 &launch_env,
                 events,
@@ -654,6 +680,7 @@ impl Workspace {
         cwd: Option<PathBuf>,
         scrollback_limit_bytes: usize,
         host_terminal_theme: crate::terminal_theme::TerminalTheme,
+        host_terminal_appearance: Option<crate::terminal_theme::HostAppearance>,
         shell_config: crate::pane::PaneShellConfig<'_>,
         extra_env: Vec<(String, String)>,
     ) -> std::io::Result<crate::workspace::tab::NewPane> {
@@ -673,6 +700,7 @@ impl Workspace {
                 cwd,
                 scrollback_limit_bytes,
                 host_terminal_theme,
+                host_terminal_appearance,
                 shell_config,
                 &launch_env,
             )?;
@@ -691,6 +719,7 @@ impl Workspace {
         extra_env: Vec<(String, String)>,
         scrollback_limit_bytes: usize,
         host_terminal_theme: crate::terminal_theme::TerminalTheme,
+        host_terminal_appearance: Option<crate::terminal_theme::HostAppearance>,
     ) -> std::io::Result<crate::workspace::tab::NewPane> {
         let pane_number = self.next_public_pane_number;
         let tab_number = self
@@ -710,11 +739,14 @@ impl Workspace {
                 &launch_env,
                 scrollback_limit_bytes,
                 host_terminal_theme,
+                host_terminal_appearance,
             )?;
         self.register_new_pane_with_number(new_pane.pane_id, pane_number);
         Ok(new_pane)
     }
 
+    // Workspace split routing carries pane identity, geometry, host context, and focus policy.
+    #[allow(clippy::too_many_arguments)]
     pub fn split_pane(
         &mut self,
         pane_id: PaneId,
@@ -724,6 +756,7 @@ impl Workspace {
         cwd: Option<PathBuf>,
         scrollback_limit_bytes: usize,
         host_terminal_theme: crate::terminal_theme::TerminalTheme,
+        host_terminal_appearance: Option<crate::terminal_theme::HostAppearance>,
         shell_config: crate::pane::PaneShellConfig<'_>,
         extra_env: Vec<(String, String)>,
         focus_new_pane: bool,
@@ -737,6 +770,7 @@ impl Workspace {
             cwd,
             scrollback_limit_bytes,
             host_terminal_theme,
+            host_terminal_appearance,
             shell_config,
             extra_env,
             focus_new_pane,
@@ -755,6 +789,7 @@ impl Workspace {
         cwd: Option<PathBuf>,
         scrollback_limit_bytes: usize,
         host_terminal_theme: crate::terminal_theme::TerminalTheme,
+        host_terminal_appearance: Option<crate::terminal_theme::HostAppearance>,
         shell_config: crate::pane::PaneShellConfig<'_>,
         extra_env: Vec<(String, String)>,
         focus_new_pane: bool,
@@ -768,6 +803,7 @@ impl Workspace {
             cwd,
             scrollback_limit_bytes,
             host_terminal_theme,
+            host_terminal_appearance,
             shell_config,
             extra_env,
             focus_new_pane,
@@ -787,6 +823,7 @@ impl Workspace {
         extra_env: Vec<(String, String)>,
         scrollback_limit_bytes: usize,
         host_terminal_theme: crate::terminal_theme::TerminalTheme,
+        host_terminal_appearance: Option<crate::terminal_theme::HostAppearance>,
         focus_new_pane: bool,
     ) -> Option<std::io::Result<(usize, crate::workspace::tab::NewPane)>> {
         self.split_pane_with_runtime(
@@ -798,6 +835,7 @@ impl Workspace {
             cwd,
             scrollback_limit_bytes,
             host_terminal_theme,
+            host_terminal_appearance,
             crate::pane::PaneShellConfig::new("", crate::config::ShellModeConfig::NonLogin),
             extra_env,
             focus_new_pane,
@@ -818,6 +856,7 @@ impl Workspace {
         extra_env: Vec<(String, String)>,
         scrollback_limit_bytes: usize,
         host_terminal_theme: crate::terminal_theme::TerminalTheme,
+        host_terminal_appearance: Option<crate::terminal_theme::HostAppearance>,
         focus_new_pane: bool,
     ) -> Option<std::io::Result<(usize, crate::workspace::tab::NewPane)>> {
         self.split_pane_with_runtime(
@@ -829,6 +868,7 @@ impl Workspace {
             cwd,
             scrollback_limit_bytes,
             host_terminal_theme,
+            host_terminal_appearance,
             crate::pane::PaneShellConfig::new("", crate::config::ShellModeConfig::NonLogin),
             extra_env,
             focus_new_pane,
@@ -847,6 +887,7 @@ impl Workspace {
         cwd: Option<PathBuf>,
         scrollback_limit_bytes: usize,
         host_terminal_theme: crate::terminal_theme::TerminalTheme,
+        host_terminal_appearance: Option<crate::terminal_theme::HostAppearance>,
         shell_config: crate::pane::PaneShellConfig<'_>,
         extra_env: Vec<(String, String)>,
         focus_new_pane: bool,
@@ -857,66 +898,40 @@ impl Workspace {
         let tab_number = self.tabs[tab_idx].number;
         let launch_env = self.launch_env_for_new_pane(tab_number, pane_number, extra_env);
         let tab = &mut self.tabs[tab_idx];
-        let previous_focus = tab.layout.focused();
-        tab.layout.focus_pane(pane_id);
         let new_pane = match if let Some(argv) = argv {
-            match ratio {
-                Some(ratio) => tab.split_focused_argv_command_with_ratio(
-                    direction,
-                    ratio,
-                    rows,
-                    cols,
-                    cwd,
-                    argv,
-                    &launch_env,
-                    scrollback_limit_bytes,
-                    host_terminal_theme,
-                ),
-                None => tab.split_focused_argv_command(
-                    direction,
-                    rows,
-                    cols,
-                    cwd,
-                    argv,
-                    &launch_env,
-                    scrollback_limit_bytes,
-                    host_terminal_theme,
-                ),
-            }
+            tab.split_pane_argv(
+                pane_id,
+                focus_new_pane,
+                direction,
+                ratio,
+                rows,
+                cols,
+                cwd,
+                argv,
+                &launch_env,
+                scrollback_limit_bytes,
+                host_terminal_theme,
+                host_terminal_appearance,
+            )
         } else {
-            match ratio {
-                Some(ratio) => tab.split_focused_with_ratio(
-                    direction,
-                    ratio,
-                    rows,
-                    cols,
-                    cwd,
-                    scrollback_limit_bytes,
-                    host_terminal_theme,
-                    shell_config,
-                    &launch_env,
-                ),
-                None => tab.split_focused(
-                    direction,
-                    rows,
-                    cols,
-                    cwd,
-                    scrollback_limit_bytes,
-                    host_terminal_theme,
-                    shell_config,
-                    &launch_env,
-                ),
-            }
+            tab.split_pane_shell(
+                pane_id,
+                focus_new_pane,
+                direction,
+                ratio,
+                rows,
+                cols,
+                cwd,
+                scrollback_limit_bytes,
+                host_terminal_theme,
+                host_terminal_appearance,
+                shell_config,
+                &launch_env,
+            )
         } {
             Ok(new_pane) => new_pane,
-            Err(err) => {
-                tab.layout.focus_pane(previous_focus);
-                return Some(Err(err));
-            }
+            Err(err) => return Some(Err(err)),
         };
-        if !focus_new_pane {
-            tab.layout.focus_pane(previous_focus);
-        }
         self.register_new_pane_with_number(new_pane.pane_id, pane_number);
         Some(Ok((tab_idx, new_pane)))
     }
@@ -996,12 +1011,13 @@ impl Workspace {
         moved: MovedPane,
         direction: Direction,
         ratio: f32,
+        focus: bool,
     ) -> Result<PaneId, MovedPane> {
         let pane_id = moved.pane_id;
         let Some(tab) = self.tabs.get_mut(tab_idx) else {
             return Err(moved);
         };
-        tab.insert_existing_pane(target_pane_id, moved, direction, ratio)?;
+        tab.insert_existing_pane(target_pane_id, moved, direction, ratio, focus)?;
         if !self.public_pane_numbers.contains_key(&pane_id) {
             self.register_new_pane_with_number(pane_id, self.next_public_pane_number);
         }
@@ -1014,7 +1030,7 @@ impl Workspace {
         label: Option<String>,
         fallback_events: mpsc::Sender<AppEvent>,
         fallback_render_notify: Arc<Notify>,
-        fallback_render_dirty: Arc<AtomicBool>,
+        fallback_render_dirty: Arc<RenderSignal>,
     ) -> usize {
         let number = self.next_public_tab_number;
         self.next_public_tab_number += 1;
@@ -1176,6 +1192,12 @@ impl Workspace {
         self.tabs.iter().find_map(|tab| tab.panes.get(&pane_id))
     }
 
+    pub fn pane_state_mut(&mut self, pane_id: PaneId) -> Option<&mut PaneState> {
+        self.tabs
+            .iter_mut()
+            .find_map(|tab| tab.panes.get_mut(&pane_id))
+    }
+
     pub fn terminal_id(&self, pane_id: PaneId) -> Option<&TerminalId> {
         self.tabs.iter().find_map(|tab| tab.terminal_id(pane_id))
     }
@@ -1246,7 +1268,7 @@ impl Workspace {
     pub(crate) fn test_new(name: &str) -> Self {
         let (events, _) = mpsc::channel(64);
         let render_notify = Arc::new(Notify::new());
-        let render_dirty = Arc::new(AtomicBool::new(false));
+        let render_dirty = Arc::new(RenderSignal::new());
         let identity_cwd = std::env::current_dir().unwrap_or_else(|_| "/".into());
         let (layout, root_id) = TileLayout::new();
         let terminal_id = TerminalId::alloc();
@@ -1304,7 +1326,7 @@ impl Workspace {
     pub(crate) fn test_add_tab(&mut self, name: Option<&str>) -> usize {
         let (events, _) = mpsc::channel(64);
         let render_notify = Arc::new(Notify::new());
-        let render_dirty = Arc::new(AtomicBool::new(false));
+        let render_dirty = Arc::new(RenderSignal::new());
         let (layout, root_id) = TileLayout::new();
         let mut panes = HashMap::new();
         panes.insert(root_id, PaneState::new(TerminalId::alloc()));
@@ -1627,7 +1649,14 @@ mod tests {
         let missing_target = PaneId::alloc();
 
         let recovered = target
-            .insert_moved_pane_into_tab(0, missing_target, taken.moved, Direction::Horizontal, 0.5)
+            .insert_moved_pane_into_tab(
+                0,
+                missing_target,
+                taken.moved,
+                Direction::Horizontal,
+                0.5,
+                true,
+            )
             .expect_err("invalid target should return the moved pane");
 
         assert_eq!(recovered.pane_id, source_pane);
@@ -1653,7 +1682,7 @@ mod tests {
         let argv = vec![command.to_string()];
         let (events, _) = mpsc::channel(64);
         let render_notify = Arc::new(Notify::new());
-        let render_dirty = Arc::new(AtomicBool::new(false));
+        let render_dirty = Arc::new(RenderSignal::new());
 
         let (workspace, _terminal, runtime) = Workspace::new_argv_command(
             root.clone(),
@@ -1662,6 +1691,7 @@ mod tests {
             &argv,
             1024,
             crate::terminal_theme::TerminalTheme::default(),
+            None,
             events,
             render_notify,
             render_dirty,

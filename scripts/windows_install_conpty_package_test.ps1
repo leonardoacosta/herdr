@@ -6,6 +6,69 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+$installerPath = (Resolve-Path -LiteralPath "$PSScriptRoot\..\website\install.ps1").Path
+$parseErrors = $null
+$tokens = $null
+$installerAst = [System.Management.Automation.Language.Parser]::ParseFile(
+    $installerPath,
+    [ref]$tokens,
+    [ref]$parseErrors
+)
+if ($parseErrors.Count -ne 0) {
+    throw ($parseErrors | Out-String)
+}
+foreach ($functionName in @("Prepend-PathEntry", "Update-PathRegistryEntry")) {
+    $definition = $installerAst.FindAll(
+        {
+            param($node)
+            $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -eq $functionName
+        },
+        $true
+    ) | Select-Object -First 1
+    if ($null -eq $definition) {
+        throw "installer is missing function $functionName"
+    }
+    Invoke-Expression $definition.Extent.Text
+}
+
+$pathTestVariable = "HERDR_INSTALLER_PATH_TEST"
+$oldPathTestVariable = [Environment]::GetEnvironmentVariable($pathTestVariable, "Process")
+$testRegistryPath = "Software\HerdrInstallerTests-$([Guid]::NewGuid().ToString('N'))"
+$testEnvironmentKey = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($testRegistryPath)
+if ($null -eq $testEnvironmentKey) {
+    throw "unable to create temporary installer test registry key"
+}
+try {
+    [Environment]::SetEnvironmentVariable($pathTestVariable, "C:\expanded", "Process")
+    $testEnvironmentKey.SetValue(
+        "Path",
+        "%$pathTestVariable%\bin;C:\existing",
+        [Microsoft.Win32.RegistryValueKind]::ExpandString
+    )
+    $pathChanged = Update-PathRegistryEntry -EnvironmentKey $testEnvironmentKey -Entry "C:\Herdr\bin"
+    if (-not $pathChanged) {
+        throw "installer PATH update reported no change"
+    }
+    if (Update-PathRegistryEntry -EnvironmentKey $testEnvironmentKey -Entry "C:\Herdr\bin") {
+        throw "installer PATH update was not idempotent"
+    }
+
+    $options = [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames
+    $rawPath = $testEnvironmentKey.GetValue("Path", $null, $options)
+    $expectedPath = "C:\Herdr\bin;%$pathTestVariable%\bin;C:\existing"
+    if ($rawPath -cne $expectedPath) {
+        throw "installer changed raw PATH: expected '$expectedPath', got '$rawPath'"
+    }
+    if ($testEnvironmentKey.GetValueKind("Path") -ne [Microsoft.Win32.RegistryValueKind]::ExpandString) {
+        throw "installer changed the PATH registry value kind"
+    }
+} finally {
+    $testEnvironmentKey.Dispose()
+    [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKeyTree($testRegistryPath, $false)
+    [Environment]::SetEnvironmentVariable($pathTestVariable, $oldPathTestVariable, "Process")
+}
+
 $archive = (Resolve-Path -LiteralPath $ArchivePath).Path
 $root = Join-Path $env:RUNNER_TEMP ("herdr-installer-test-" + [Guid]::NewGuid().ToString("N"))
 $webRoot = Join-Path $root "web"
@@ -50,10 +113,56 @@ try {
         }
     }
 
-    & "$PSScriptRoot\..\website\install.ps1" `
-        -ManifestUrl $manifestUrl `
-        -InstallDir $installDir `
-        -ExpectedBuildId "installer-test"
+    # Keep the existing positional web-installer contract, including Retain in slot five.
+    & "$PSScriptRoot\..\website\install.ps1" "preview" $manifestUrl $installDir "installer-test" 3
+
+    $localInstallDir = Join-Path $root "local-bin"
+    $env:HERDR_HOME = Join-Path $root "local-home"
+    $partialLocalModeRejected = $false
+    try {
+        & $installerPath `
+            -InstallDir $localInstallDir `
+            -LocalPackagePath $archive
+    } catch {
+        if ($_.Exception.Message -notlike "Local package mode requires*") {
+            throw
+        }
+        $partialLocalModeRejected = $true
+    }
+    if (-not $partialLocalModeRejected) {
+        throw "installer accepted partial local-package inputs"
+    }
+
+    $badLocalChecksumRejected = $false
+    try {
+        & $installerPath `
+            -ManifestUrl "$manifestUrl/unused" `
+            -InstallDir $localInstallDir `
+            -LocalPackagePath $archive `
+            -LocalPackageFormat "zip" `
+            -LocalPackageIdentity "0.0.0-preview.local-package" `
+            -LocalPackageSha256 ("0" * 64)
+    } catch {
+        if ($_.Exception.Message -notlike "Downloaded Herdr checksum did not match.*") {
+            throw
+        }
+        $badLocalChecksumRejected = $true
+    }
+    if (-not $badLocalChecksumRejected) {
+        throw "installer accepted a local package with the wrong checksum"
+    }
+
+    & $installerPath `
+        -ManifestUrl "$manifestUrl/unused" `
+        -InstallDir $localInstallDir `
+        -LocalPackagePath $archive `
+        -LocalPackageFormat "zip" `
+        -LocalPackageIdentity "0.0.0-preview.local-package" `
+        -LocalPackageSha256 $hash
+    if (-not (Test-Path -LiteralPath (Join-Path $localInstallDir "herdr.exe") -PathType Leaf)) {
+        throw "installer did not activate the verified local package"
+    }
+    $env:HERDR_HOME = $herdrHome
 
     $required = @(
         "herdr.exe",
@@ -70,7 +179,8 @@ try {
         }
     }
 
-    $releaseDir = Get-ChildItem -LiteralPath (Join-Path $herdrHome "packages\standalone\releases") -Directory |
+    $releasesDir = Join-Path $herdrHome "packages\standalone\releases"
+    $releaseDir = Get-ChildItem -LiteralPath $releasesDir -Directory |
         Where-Object { -not $_.Name.StartsWith(".staging.") } |
         Select-Object -First 1
     if ($null -eq $releaseDir) {
@@ -101,6 +211,53 @@ try {
     }
 
     $manifest | Out-File -LiteralPath $manifestPath -Encoding utf8
+    $stagedConpty = Join-Path $releasesDir ".staging.$($releaseDir.Name).$PID\conpty\conpty.dll"
+    $lockState = @{ Handle = $null }
+    $lockStagedFile = {
+        if ($null -eq $lockState.Handle) {
+            $lockState.Handle = [System.IO.File]::Open(
+                $stagedConpty,
+                [System.IO.FileMode]::Open,
+                [System.IO.FileAccess]::Read,
+                [System.IO.FileShare]::Read
+            )
+        }
+    }.GetNewClosure()
+    $swapBreakpoint = Set-PSBreakpoint -Script $installerPath -Variable "backupDir" -Mode Write -Action $lockStagedFile
+    try {
+        $swapFailed = $false
+        try {
+            & "$PSScriptRoot\..\website\install.ps1" `
+                -ManifestUrl $manifestUrl `
+                -InstallDir $installDir `
+                -ExpectedBuildId "installer-test"
+        } catch {
+            $swapFailed = $true
+        }
+        if ($null -eq $lockState.Handle) {
+            throw "installer did not acquire the staged file handle before the swap"
+        }
+        if (-not $swapFailed) {
+            throw "installer unexpectedly activated a release with a locked staged file"
+        }
+        if (-not (Test-Path -LiteralPath (Join-Path $releaseDir.FullName "herdr.exe") -PathType Leaf)) {
+            throw "failed activation did not restore the prior release"
+        }
+        if (@(Get-ChildItem -LiteralPath $releasesDir -Force -Directory -Filter ".backup.$($releaseDir.Name).*").Count -ne 0) {
+            throw "failed activation stranded a release backup"
+        }
+        foreach ($junction in @($installDir, (Join-Path $herdrHome "packages\standalone\current"))) {
+            if (-not (Test-Path -LiteralPath (Join-Path $junction "herdr.exe") -PathType Leaf)) {
+                throw "failed activation left an invalid installer junction at $junction"
+            }
+        }
+    } finally {
+        Remove-PSBreakpoint -Breakpoint $swapBreakpoint
+        if ($null -ne $lockState.Handle) {
+            $lockState.Handle.Dispose()
+        }
+    }
+
     & "$PSScriptRoot\..\website\install.ps1" `
         -ManifestUrl $manifestUrl `
         -InstallDir $installDir `
